@@ -1,0 +1,620 @@
+"""
+Manipulator-X (4-DoF with parallel gripper) — PyBullet demo
+
+Summary:
+- An OpenManipulator-X-like arm: 4 DOF + prismatic Y for the gripper base, with a parallel gripper
+- Fold/unfold gestures and blended motion for safe transitions
+- Supports manual jogging and automatic trajectory tracking (circle/lem)
+
+Common usage:
+  python manipulator_x_pybullet_sim.py --gui --traj circle
+
+Keyboard controls and behavior are described in the file comments.
+"""
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Manipulator-X (4-DoF + parallel gripper, prismatic axis = Y)
+OM-X style offsets + connector visuals + anti-snap unfold
++ Q/E base yaw jog
++ [ ] = close/open (press-and-hold continuous control)
++ M/N = EE height down/up (press-and-hold)  <-- NEW
+"""
+
+import argparse, math, time, tempfile
+from pathlib import Path
+from collections import deque
+import numpy as np
+import pybullet as p
+import pybullet_data
+
+# ----------------------------
+# input helpers (edge / hold)
+# ----------------------------
+EDGE = p.KEY_WAS_TRIGGERED
+ISDN = p.KEY_IS_DOWN
+def key_edge(keys, *codes): return any((c in keys) and (keys[c] & EDGE) for c in codes)
+def key_down(keys, *codes): return any((c in keys) and (keys[c] & ISDN) for c in codes)
+
+K_F = [ord('f'), ord('F')]
+K_B = [ord('b'), ord('B')]
+K_S = [ord('s'), ord('S')]
+K_Y = [ord('y'), ord('Y')]
+K_Z = [ord('z'), ord('Z')]   # step z-
+K_X = [ord('x'), ord('X')]   # step z+
+K_M = [ord('m'), ord('M')]   # hold z-
+K_N = [ord('n'), ord('N')]   # hold z+
+K_P = [ord('p'), ord('P')]
+K_R = [ord('r'), ord('R')]
+K_C = [ord('c'), ord('C')]
+K_H = [ord('h'), ord('H')]
+K_J = [ord('j'), ord('J')]
+K_Q = [ord('q'), ord('Q')]
+K_E = [ord('e'), ord('E')]
+K_LBR = [ord('[')]
+K_RBR = [ord(']')]
+K_PLUS  = [ord('+'), ord('='), 43, 61]
+K_MINUS = [ord('-'), 45]
+
+def clamp(x, lo, hi): return lo if x < lo else hi if x > hi else x
+def s_curve(a: float) -> float:
+    a = clamp(a, 0.0, 1.0)
+    return a*a*(3.0 - 2.0*a)
+def write_tmp(text: str, name: str) -> str:
+    path = Path(tempfile.gettempdir()) / name
+    path.write_text(text)
+    return str(path)
+
+# ---------------------------------
+# URDF (OM-X-like offsets + connectors)
+# ---------------------------------
+def openmanipulator_x_urdf():
+    w = 0.025; h = 0.025
+    def box_I(m, lx, ly, lz):
+        ixx = (1/12)*m*(ly*ly + lz*lz)
+        iyy = (1/12)*m*(lx*lx + lz*lz)
+        izz = (1/12)*m*(lx*lx + ly*ly)
+        return ixx, iyy, izz
+
+    m = 0.25
+    I_dummy = (1e-4, 1e-4, 1e-4)
+
+    tz1 = 0.077
+    tz2 = 0.128
+    tx1 = 0.024
+    L2  = 0.150   # reach 보정
+    L3  = 0.160
+
+    i2 = box_I(m, L2, w, h)
+    i3 = box_I(m, L3, w, h)
+
+    return f"""<?xml version='1.0'?>
+<robot name='manipulator_x_omx'>
+
+  <link name='base'>
+    <inertial><origin xyz='0 0 0'/><mass value='1.0'/>
+      <inertia ixx='1e-3' iyy='1e-3' izz='1e-3' ixy='0' ixz='0' iyz='0'/>
+    </inertial>
+    <visual>
+      <origin xyz='0 0 0.035'/><geometry><cylinder radius='0.06' length='0.07'/></geometry>
+      <material name='grey'><color rgba='0.6 0.6 0.6 1'/></material>
+    </visual>
+  </link>
+
+  <joint name='joint1' type='revolute'>
+    <parent link='base'/><child link='link1'/>
+    <origin xyz='0 0 0.07'/>
+    <axis xyz='0 0 1'/>
+    <limit lower='-{math.pi}' upper='{math.pi}' effort='60' velocity='6'/>
+    <dynamics damping='0.06' friction='0.02'/>
+  </joint>
+
+  <link name='link1'>
+    <inertial><mass value='0.05'/><inertia ixx='{I_dummy[0]}' iyy='{I_dummy[1]}' izz='{I_dummy[2]}' ixy='0' ixz='0' iyz='0'/></inertial>
+    <visual>
+      <origin xyz='0 0 {tz1/2}'/><geometry><box size='0.02 0.02 {tz1}'/></geometry>
+      <material name='blue'><color rgba='0.2 0.4 0.9 1'/></material>
+    </visual>
+  </link>
+
+  <joint name='lift_z1' type='fixed'>
+    <parent link='link1'/><child link='lift1'/>
+    <origin xyz='0 0 {tz1}'/>
+  </joint>
+  <link name='lift1'>
+    <inertial><mass value='0.01'/><inertia ixx='{I_dummy[0]}' iyy='{I_dummy[1]}' izz='{I_dummy[2]}' ixy='0' ixz='0' iyz='0'/></inertial>
+  </link>
+
+  <joint name='joint2' type='revolute'>
+    <parent link='lift1'/><child link='link2_stub'/>
+    <origin xyz='0 0 0'/><axis xyz='0 1 0'/>
+    <limit lower='-{math.radians(130)}' upper='{math.radians(130)}' effort='50' velocity='6'/>
+    <dynamics damping='0.05' friction='0.02'/>
+  </joint>
+
+  <link name='link2_stub'>
+    <inertial><mass value='0.02'/><inertia ixx='{I_dummy[0]}' iyy='{I_dummy[1]}' izz='{I_dummy[2]}' ixy='0' ixz='0' iyz='0'/></inertial>
+    <visual>
+      <origin xyz='0 0 0'/><geometry><box size='0.03 0.03 0.03'/></geometry>
+      <material name='jointcap'><color rgba='0.3 0.3 0.35 1'/></material>
+    </visual>
+  </link>
+
+  <joint name='lift_z2' type='fixed'>
+    <parent link='link2_stub'/><child link='lift2'/>
+    <origin xyz='0 0 {tz2}'/>
+  </joint>
+  <link name='lift2'>
+    <inertial><mass value='0.01'/><inertia ixx='{I_dummy[0]}' iyy='{I_dummy[1]}' izz='{I_dummy[2]}' ixy='0' ixz='0' iyz='0'/></inertial>
+    <visual>
+      <origin xyz='0 0 {-tz2/2}'/><geometry><box size='0.02 0.02 {tz2}'/></geometry>
+      <material name='pillarZ'><color rgba='0.25 0.7 0.9 1'/></material>
+    </visual>
+  </link>
+
+  <joint name='shift_x1' type='fixed'>
+    <parent link='lift2'/><child link='shift1'/>
+    <origin xyz='{tx1} 0 0'/>
+  </joint>
+  <link name='shift1'>
+    <inertial><mass value='0.01'/><inertia ixx='{I_dummy[0]}' iyy='{I_dummy[1]}' izz='{I_dummy[2]}' ixy='0' ixz='0' iyz='0'/></inertial>
+    <visual>
+      <origin xyz='{-tx1/2} 0 0'/><geometry><box size='{tx1} 0.02 0.02'/></geometry>
+      <material name='spacerX'><color rgba='0.9 0.6 0.2 1'/></material>
+    </visual>
+  </link>
+
+  <joint name='joint3' type='revolute'>
+    <parent link='shift1'/><child link='link2'/>
+    <origin xyz='0 0 0'/><axis xyz='0 1 0'/>
+    <limit lower='-{math.radians(140)}' upper='{math.radians(140)}' effort='45' velocity='6'/>
+    <dynamics damping='0.05' friction='0.02'/>
+  </joint>
+
+  <link name='link2'>
+    <inertial><mass value='{m}'/>
+      <inertia ixx='{i2[0]}' iyy='{i2[1]}' izz='{i2[2]}' ixy='0' ixz='0' iyz='0'/>
+    </inertial>
+    <visual>
+      <origin xyz='{L2/2} 0 0'/><geometry><box size='{L2} {w} {h}'/></geometry>
+      <material name='green'><color rgba='0.2 0.8 0.4 1'/></material>
+    </visual>
+    <collision><origin xyz='{L2/2} 0 0'/><geometry><box size='{L2} {w} {h}'/></geometry></collision>
+  </link>
+
+  <joint name='joint4' type='revolute'>
+    <parent link='link2'/><child link='link3'/>
+    <origin xyz='{L2} 0 0'/><axis xyz='0 1 0'/>
+    <limit lower='-{math.radians(150)}' upper='{math.radians(150)}' effort='40' velocity='7'/>
+    <dynamics damping='0.05' friction='0.02'/>
+  </joint>
+
+  <link name='link3'>
+    <inertial><mass value='{m}'/>
+      <inertia ixx='{i3[0]}' iyy='{i3[1]}' izz='{i3[2]}' ixy='0' ixz='0' iyz='0'/>
+    </inertial>
+    <visual>
+      <origin xyz='{L3/2} 0 0'/><geometry><box size='{L3} {w} {h}'/></geometry>
+      <material name='orange'><color rgba='0.95 0.6 0.2 1'/></material>
+    </visual>
+    <collision><origin xyz='{L3/2} 0 0'/><geometry><box size='{L3} {w} {h}'/></geometry></collision>
+  </link>
+
+  <joint name='tool_fixed' type='fixed'>
+    <parent link='link3'/><child link='tool'/>
+    <origin xyz='{L3} 0 0'/>
+  </joint>
+
+  <link name='tool'>
+    <inertial><mass value='0.05'/><inertia ixx='1e-4' iyy='1e-4' izz='1e-4' ixy='0' ixz='0' iyz='0'/>
+    </inertial>
+    <!-- wrist connector: 링크3 끝과 자연스럽게 이어지도록 -->
+    <visual>
+      <origin xyz='0.03 0 0'/><geometry><box size='0.06 0.022 0.022'/></geometry>
+      <material name='wrist'><color rgba='0.15 0.15 0.15 1'/></material>
+    </visual>
+  </link>
+
+  <!-- Parallel gripper (axis Y, mirrored) -->
+  <joint name='finger_left_joint' type='prismatic'>
+    <parent link='tool'/><child link='finger_left'/>
+    <origin xyz='0.06  0.015 0'/>
+    <axis xyz='0 1 0'/>
+    <limit lower='0.0' upper='0.0275' effort='20' velocity='0.30'/>
+    <dynamics damping='0.02' friction='0.01'/>
+  </joint>
+  <link name='finger_left'>
+    <inertial><mass value='0.02'/><inertia ixx='5e-5' iyy='5e-5' izz='5e-5' ixy='0' ixz='0' iyz='0'/>
+    </inertial>
+    <visual><origin xyz='0 0 0'/><geometry><box size='0.03 0.01 0.02'/></geometry>
+      <material name='silver'><color rgba='0.8 0.8 0.8 1'/></material></visual>
+  </link>
+
+  <joint name='finger_right_joint' type='prismatic'>
+    <parent link='tool'/><child link='finger_right'/>
+    <origin xyz='0.06 -0.015 0'/>
+    <axis xyz='0 -1 0'/>
+    <limit lower='0.0' upper='0.0275' effort='20' velocity='0.30'/>
+    <dynamics damping='0.02' friction='0.01'/>
+  </joint>
+  <link name='finger_right'>
+    <inertial><mass value='0.02'/><inertia ixx='5e-5' iyy='5e-5' izz='5e-5' ixy='0' ixz='0' iyz='0'/>
+    </inertial>
+    <visual><origin xyz='0 0 0'/><geometry><box size='0.03 0.01 0.02'/></geometry>
+      <material name='silver2'><color rgba='0.85 0.85 0.85 1'/></material></visual>
+  </link>
+
+</robot>
+"""
+
+# ----------------
+# PyBullet runner
+# ----------------
+def connect(gui=False):
+    cid = p.connect(p.GUI if gui else p.DIRECT)
+    p.setAdditionalSearchPath(pybullet_data.getDataPath())
+    p.resetSimulation()
+    p.setTimeStep(1/240.0)
+    p.setGravity(0, 0, -9.81)
+    p.setPhysicsEngineParameter(numSolverIterations=150, erp=0.2, fixedTimeStep=1/240.0)
+    plane_id = p.loadURDF("plane.urdf")
+    return cid, plane_id
+
+def step(gui=False):
+    p.stepSimulation()
+    if gui: time.sleep(1/240.0)
+
+def run(traj="circle", gui=False):
+    dt = 1/240.0
+    cid, plane_id = connect(gui)
+    p.resetDebugVisualizerCamera(1.6, 40, -30, [0.25, 0.0, 0.15])
+    if gui: p.configureDebugVisualizer(p.COV_ENABLE_GUI, 1)
+    debug_gui = True
+
+    urdf_path = write_tmp(openmanipulator_x_urdf(), "manipulator_x_omx_connectors.urdf")
+    arm = p.loadURDF(urdf_path, basePosition=[0,0,0], useFixedBase=True, flags=p.URDF_USE_INERTIA_FROM_FILE)
+    nJ = p.getNumJoints(arm)
+
+    # name -> index
+    name_to_idx = {p.getJointInfo(arm,i)[1].decode(): i for i in range(nJ)}
+    J1 = name_to_idx['joint1']
+    J2 = name_to_idx['joint2']
+    J3 = name_to_idx['joint3']
+    J4 = name_to_idx['joint4']
+    F_L = name_to_idx['finger_left_joint']
+    F_R = name_to_idx['finger_right_joint']
+
+    # tool link index
+    tool_link = -1
+    for i in range(p.getNumJoints(arm)):
+        if p.getJointInfo(arm,i)[12].decode() == 'tool':
+            tool_link = i; break
+
+    # collision filters (adjacent)
+    for a,b in [(J1,J2),(J2,J3),(J3,J4)]: p.setCollisionFilterPair(arm, a, arm, b, enableCollision=0)
+
+    # parallel gripper gear (axis Y, ratio -1)
+    gear = p.createConstraint(arm, F_L, arm, F_R, p.JOINT_GEAR, [0,1,0], [0,0,0], [0,0,0])
+    p.changeConstraint(gear, gearRatio=-1, erp=0.2, maxForce=100)
+
+    # ground grid
+    for i in range(-6, 13):
+        p.addUserDebugLine([i*0.05, -0.7, 0], [i*0.05, 0.7, 0], [0.7,0.7,0.7], 0)
+    for j in range(-14, 15):
+        p.addUserDebugLine([-0.35, j*0.05, 0], [0.95, j*0.05, 0], [0.7,0.7,0.7], 0)
+
+    # ---- state ----
+    paused = False
+    Z_FLOOR = 0.07
+    Z_MAX = 0.45
+    z_speed = 0.20  # m/s for M/N
+
+    speed = 1.0
+    elbow_up = True
+
+    # Gripper analog control
+    GRIP_MAX = 0.0275
+    GRIP_MIN = 0.000
+    grip_pos_init = 0.012
+    grip_pos = grip_pos_init
+    grip_speed = 0.020  # m/s
+
+    z_offset = 0.10
+    center = np.array([0.28, 0.00, z_offset])
+    t = 0.0
+
+    manual = False
+    radial_speed = 0.35
+    hold_pos = np.array([0.28, 0.00, z_offset])
+    handover = False
+    handover_alpha = 0.0
+    handover_dur = 0.6
+
+    # AUTO gate + base yaw jog
+    track_auto = True
+    hold_q = [0.0, 0.2, -0.4, 0.2]
+    base_yaw_target = p.getJointState(arm, J1)[0]
+    yaw_jog_speed = 0.9  # rad/s
+
+    # fold/unfold
+    folding = False
+    fold_q_goal = [0.0, -1.0, 1.2, -0.5]
+    fold_speed_limit = 3.0
+    fold_pos_gain = 0.6
+    fold_vel_gain = 1.0
+    fold_force = [80, 70, 60, 50]
+    fold_tol = 0.01
+    fold_alpha = 0.0
+    fold_dur = 0.6
+    fold_start_q = [0.0, 0.0, 0.0, 0.0]
+    fold_t0 = 0.0
+    fold_min_time = 0.3
+
+    unfolding = False
+    ready_q_goal = [0.0, 0.2, -0.4, 0.2]
+    ready_speed_limit = 3.0
+    ready_pos_gain = 0.62
+    ready_vel_gain = 1.0
+    ready_force = [80, 70, 60, 50]
+    ready_tol = 0.009
+    unfold_alpha = 0.0
+    unfold_dur = 0.6
+    unfold_start_q = [0.0, 0.0, 0.0, 0.0]
+    unfold_t0 = 0.0
+    ready_min_time = 0.35
+
+    trace = deque(maxlen=700)
+    trace_tick = 0
+    tgt_id, tgt_tick = None, 0
+
+    def default_target(tt):
+        if traj == 'lem':
+            a=0.16
+            return np.array([center[0] + a*math.sin(0.8*tt),
+                             center[1] + a*math.sin(1.6*tt),
+                             center[2]])
+        r=0.15
+        return np.array([center[0] + r*math.cos(0.6*tt),
+                         center[1] + r*math.sin(0.6*tt),
+                         center[2]])
+
+    def current_ee():
+        st = p.getLinkState(arm, tool_link, computeForwardKinematics=True)
+        return np.array(st[4]) if st else np.array([0,0,z_offset])
+
+    print("[Keys] F unfold, B fold, J jog, S handover, [ close, ] open, Q/E base yaw, Y elbow, M/N z- z+ (hold), Z/X step z, +/- speed, H UI, P pause, R reset, C clear")
+
+    # IK bounds
+    lower = [-math.pi, -math.radians(130), -math.radians(140), -math.radians(150)]
+    upper = [ math.pi,  math.radians(130),  math.radians(140),  math.radians(150)]
+    ranges = [u - l for l,u in zip(lower, upper)]
+    rest_up   = [0.0,  0.7, -1.1,  0.7]
+    rest_down = [0.0, -0.7,  1.1, -0.7]
+    damping = [0.06]*nJ
+
+    last_b_t, last_f_t, DEBOUNCE = -1.0, -1.0, 0.25
+
+    while True:
+        if gui:
+            keys = p.getKeyboardEvents()
+            if key_edge(keys, *K_PLUS):  speed = min(3.0, speed*1.2); print('[key] + : speed ->', round(speed,4))
+            if key_edge(keys, *K_MINUS): speed = max(0.2, speed/1.2); print('[key] - : speed ->', round(speed,4))
+            if key_edge(keys, *K_Y):     elbow_up = not elbow_up; print('[key] Y : elbow_up =', elbow_up)
+            if key_edge(keys, *K_P):     paused = not paused; print('[key] P : paused =', paused)
+
+            if key_edge(keys, *K_R):
+                for j in [J1,J2,J3,J4,F_L,F_R]: p.resetJointState(arm, j, 0.0)
+                trace.clear(); t=0.0
+                manual=False; handover=False; folding=False; unfolding=False
+                track_auto=True
+                z_offset = 0.10; center[2]=z_offset
+                base_yaw_target = 0.0; hold_q = [0.0, 0.2, -0.4, 0.2]
+                grip_pos = grip_pos_init
+                print('[key] R : reset')
+
+            if key_edge(keys, *K_C): trace.clear(); print('[key] C : clear trace')
+
+            if key_edge(keys, *K_H):
+                debug_gui = not debug_gui
+                if gui: p.configureDebugVisualizer(p.COV_ENABLE_GUI, 1 if debug_gui else 0)
+                print('[key] H : debug panel =', 'SHOW' if debug_gui else 'HIDE')
+
+            if key_edge(keys, *K_J):
+                manual=True; handover=False; folding=False; unfolding=False; track_auto=False
+                hold_pos = current_ee()
+                print('[key] J : manual JOG start')
+
+            # step z (legacy)
+            if key_edge(keys, *K_Z): z_offset = max(Z_FLOOR, z_offset - 0.01); center[2]=z_offset; print('[key] Z : z_offset ->', round(z_offset,3))
+            if key_edge(keys, *K_X): z_offset = min(Z_MAX,   z_offset + 0.01); center[2]=z_offset; print('[key] X : z_offset ->', round(z_offset,3))
+
+            # hold z (continuous) -- NEW
+            if key_down(keys, *K_M):
+                z_offset = max(Z_FLOOR, z_offset - z_speed*dt); center[2]=z_offset
+            if key_down(keys, *K_N):
+                z_offset = min(Z_MAX,   z_offset + z_speed*dt); center[2]=z_offset
+
+            if key_edge(keys, *K_F) and (t - last_f_t > DEBOUNCE):
+                last_f_t = t
+                manual=False; handover=False; folding=False
+                unfolding=True; track_auto=False
+                base_yaw_target = p.getJointState(arm, J1)[0]
+                q1 = base_yaw_target
+                ready_q_goal = [q1, 0.2, -0.4, 0.2]
+                unfold_start_q = [p.getJointState(arm, j)[0] for j in [J1,J2,J3,J4]]
+                unfold_alpha = 0.0; unfold_t0 = t
+                print('[key] F : unfold start')
+
+            if key_edge(keys, *K_B) and (t - last_b_t > DEBOUNCE):
+                last_b_t = t
+                if folding:
+                    folding=False; print('[key] B : fold cancel')
+                else:
+                    manual=False; handover=False; unfolding=False
+                    folding=True; track_auto=False
+                    base_yaw_target = p.getJointState(arm, J1)[0]
+                    q1 = base_yaw_target
+                    r_stow, z_stow = 0.06, 0.17
+                    c, s = math.cos(q1), math.sin(q1)
+                    stow = np.array([c*r_stow, s*r_stow, z_stow])
+                    lower_f = lower.copy(); upper_f = upper.copy()
+                    lower_f[0] = upper_f[0] = q1
+                    ranges_f = [u-l for l,u in zip(lower_f, upper_f)]
+                    rest_in = [q1, 0.9, -1.2, 0.35] if elbow_up else [q1, -0.9, 1.2, -0.35]
+                    q_ik = p.calculateInverseKinematics(arm, tool_link, stow.tolist(),
+                                                         lowerLimits=lower_f, upperLimits=upper_f,
+                                                         jointRanges=ranges_f, restPoses=rest_in,
+                                                         jointDamping=damping, maxNumIterations=120,
+                                                         residualThreshold=1e-5)
+                    fold_q_goal = [q1, q_ik[1], q_ik[2], q_ik[3]]
+                    fold_start_q = [p.getJointState(arm, j)[0] for j in [J1,J2,J3,J4]]
+                    fold_alpha = 0.0; fold_t0 = t
+                    print('[key] B : fold start (inboard)')
+
+            if key_edge(keys, *K_S):
+                manual=False; folding=False; unfolding=False
+                hold_pos = current_ee()
+                handover=True; handover_alpha=0.0
+                track_auto=True
+                print('[key] S : handover -> auto')
+
+            # base yaw jog
+            if key_down(keys, *K_Q): base_yaw_target -= yaw_jog_speed*dt
+            if key_down(keys, *K_E): base_yaw_target += yaw_jog_speed*dt
+            if base_yaw_target > math.pi:  base_yaw_target -= 2*math.pi
+            if base_yaw_target < -math.pi: base_yaw_target += 2*math.pi
+            hold_q[0] = base_yaw_target
+
+            # gripper control
+            if key_down(keys, *K_LBR):  # close
+                grip_pos = max(GRIP_MIN, grip_pos - grip_speed*dt)
+            if key_down(keys, *K_RBR):  # open
+                grip_pos = min(GRIP_MAX, grip_pos + grip_speed*dt)
+
+        if not paused:
+            # -------- HOLD (z jog도 반영하도록 IK로 추종) --------
+            if (not track_auto) and (not folding) and (not unfolding) and (not handover) and (not manual):
+                # 원하는 EE: 현재 x,y 유지 + z_offset
+                ee_now = current_ee()
+                des = np.array([ee_now[0], ee_now[1], max(Z_FLOOR, min(Z_MAX, z_offset))])
+                # base yaw 고정한 IK
+                lower_l = lower.copy(); upper_u = upper.copy()
+                lower_l[0] = upper_u[0] = base_yaw_target
+                ranges_l = [u-l for l,u in zip(lower_l, upper_u)]
+                rest = rest_up if elbow_up else rest_down
+                q_hold = p.calculateInverseKinematics(arm, tool_link, des.tolist(),
+                                                      lowerLimits=lower_l, upperLimits=upper_u,
+                                                      jointRanges=ranges_l, restPoses=[base_yaw_target]+(rest[1:]),
+                                                      jointDamping=damping, maxNumIterations=80, residualThreshold=8e-5)
+                # 구동
+                p.setJointMotorControl2(arm, J1, p.POSITION_CONTROL,
+                                        targetPosition=base_yaw_target, positionGain=0.5, velocityGain=1.0,
+                                        force=50, maxVelocity=2.5)
+                for jid, qd, fmax in zip([J2,J3,J4], q_hold[1:4], [45,40,35]):
+                    p.setJointMotorControl2(arm, jid, p.POSITION_CONTROL,
+                                            targetPosition=qd, positionGain=0.5, velocityGain=1.0,
+                                            force=fmax, maxVelocity=2.5)
+                # hold_q 갱신
+                hold_q = [base_yaw_target, q_hold[1], q_hold[2], q_hold[3]]
+                # gripper
+                p.setJointMotorControl2(arm, F_L, p.POSITION_CONTROL,
+                                        targetPosition=grip_pos, positionGain=0.8, velocityGain=1.0,
+                                        force=20.0, maxVelocity=0.30*speed)
+                p.setJointMotorControl2(arm, F_R, p.VELOCITY_CONTROL, force=0.0)
+                t += dt; step(gui); continue
+
+            # -------- folding / unfolding --------
+            if folding or unfolding:
+                def blend_and_drive(alpha, start_q, goal_q, pos_gain, vel_gain, force, vmax):
+                    s = s_curve(alpha)
+                    q_blend = [fs + s*(fg - fs) for fs, fg in zip(start_q, goal_q)]
+                    for jid, qd, fmax in zip([J1,J2,J3,J4], q_blend, force):
+                        p.setJointMotorControl2(arm, jid, p.POSITION_CONTROL,
+                                                targetPosition=qd, positionGain=pos_gain, velocityGain=vel_gain,
+                                                force=fmax, maxVelocity=vmax)
+                if folding:
+                    fold_alpha = min(1.0, fold_alpha + dt/max(1e-6, fold_dur))
+                    blend_and_drive(fold_alpha, fold_start_q, fold_q_goal, 0.6, 1.0, [80,70,60,50], 3.0)
+                    cur_js = [p.getJointState(arm, j) for j in [J1,J2,J3,J4]]
+                    cur = [s[0] for s in cur_js]; cur_vel = [abs(s[1]) for s in cur_js]
+                    if (fold_alpha>=1.0) and ((t-fold_t0)>=0.3) and \
+                       (max(abs(g-c) for g,c in zip(fold_q_goal, cur))<0.01) and (max(cur_vel)<0.10):
+                        folding=False; track_auto=False; hold_q=fold_q_goal[:]
+                else:
+                    unfold_alpha = min(1.0, unfold_alpha + dt/max(1e-6, unfold_dur))
+                    blend_and_drive(unfold_alpha, unfold_start_q, ready_q_goal, 0.62, 1.0, [80,70,60,50], 3.0)
+                    cur_js = [p.getJointState(arm, j) for j in [J1,J2,J3,J4]]
+                    cur = [s[0] for s in cur_js]; cur_vel = [abs(s[1]) for s in cur_js]
+                    if (unfold_alpha>=1.0) and ((t-unfold_t0)>=0.35) and \
+                       (max(abs(g-c) for g,c in zip(ready_q_goal, cur))<0.009) and (max(cur_vel)<0.10):
+                        unfolding=False; track_auto=False; hold_q = ready_q_goal[:]
+
+            else:
+                # -------- AUTO / manual / handover tracking --------
+                if manual:
+                    ee = current_ee()
+                    v = ee - np.array([0,0,0.07]); v[2]=0.0
+                    L = np.linalg.norm(v[:2]) + 1e-9
+                    dir_xy = v[:2]/L
+                    desired_xy = ee[:2] + dir_xy * (radial_speed*dt if np.linalg.norm(ee[:2]-center[:2])<0.35 else -radial_speed*dt)
+                    des = np.array([desired_xy[0], desired_xy[1], z_offset])
+                elif handover:
+                    default_des = default_target(t)
+                    handover_alpha = min(1.0, handover_alpha + dt/max(1e-6, handover_dur))
+                    des = (1.0 - handover_alpha) * hold_pos + handover_alpha * default_des
+                    if handover_alpha >= 1.0: handover=False
+                else:
+                    des = default_target(t)
+
+                # marker
+                tgt_tick += 1
+                if tgt_tick % 8 == 0:
+                    if tgt_id is not None: p.removeUserDebugItem(tgt_id)
+                    tgt_id = p.addUserDebugLine(des, des+np.array([0,0,0.03]), [0,1,0], 2, 0.5)
+
+                # IK with base yaw lock
+                rest = rest_up if elbow_up else rest_down
+                des[2] = max(Z_FLOOR, min(Z_MAX, des[2]))
+                if len(p.getContactPoints(arm, plane_id)): des[2] = max(des[2], Z_FLOOR + 0.02)
+
+                lower_l = lower.copy(); upper_u = upper.copy()
+                lower_l[0] = upper_u[0] = base_yaw_target
+                ranges_l = [u-l for l,u in zip(lower_l, upper_u)]
+
+                q = p.calculateInverseKinematics(arm, tool_link, des.tolist(),
+                                                 lowerLimits=lower_l, upperLimits=upper_u,
+                                                 jointRanges=ranges_l, restPoses=[base_yaw_target]+(rest[1:]),
+                                                 jointDamping=damping, maxNumIterations=80, residualThreshold=8e-5)
+
+                for jid, qd, fmax, vmax in zip([J1,J2,J3,J4], q[:4], [40,36,32,30], [6,6,6,7]):
+                    p.setJointMotorControl2(arm, jid, p.POSITION_CONTROL,
+                                            targetPosition=qd, positionGain=0.42, velocityGain=1.0,
+                                            force=fmax, maxVelocity=vmax*speed)
+
+                # gripper
+                p.setJointMotorControl2(arm, F_L, p.POSITION_CONTROL,
+                                        targetPosition=grip_pos, positionGain=0.8, velocityGain=1.0,
+                                        force=20.0, maxVelocity=0.30*speed)
+                p.setJointMotorControl2(arm, F_R, p.VELOCITY_CONTROL, force=0.0)
+
+                # EE trace
+                st = p.getLinkState(arm, tool_link, computeForwardKinematics=True)
+                if st is not None:
+                    ee = np.array(st[4])
+                    trace_tick += 1
+                    if trace_tick % 6 == 0:
+                        if len(trace)==0 or np.linalg.norm(ee - trace[-1]) >= 0.003:
+                            trace.append(ee)
+                            if len(trace) >= 2:
+                                p.addUserDebugLine(trace[-2], trace[-1], [0.1,0.9,0.1], 0.8)
+
+            t += dt
+        step(gui)
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--gui", action="store_true")
+    ap.add_argument("--traj", choices=["circle","lem"], default="circle")
+    args = ap.parse_args()
+    run(traj=args.traj, gui=args.gui)

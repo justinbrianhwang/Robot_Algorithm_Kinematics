@@ -1,0 +1,297 @@
+"""
+Quad-X UAV simulation — simplified aerodynamic and controller demo
+
+Summary:
+- Simple controller stack: position/velocity PD -> desired roll/pitch -> attitude PID -> motor allocation
+- Supports hover, takeoff, land, wind forcing, and simple turbulence toggle
+- Simulation rate and logging options available via CLI
+
+Examples:
+  python uav_pybullet_sim.py --gui
+  python uav_pybullet_sim.py --simrate 0.5
+  python uav_pybullet_sim.py --gui --wind 0.5 0.0 0.0
+"""
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+UAV (Quad-X) — PyBullet Simulation (v1.6 no-CSV)
+
+- ↑↓←→ : yaw 기준 수평 "목표 속도" (누르는 동안만)
+- W / S : 상승 / 하강 "속도 명령" (누르는 동안만)  [보조: PageUp / PageDown]
+- Q / E : 요 회전
+- SPACE : hover hold 토글
+- T / L : 이륙(1.5m) / 착륙
+- P     : 일시정지
+- C     : 소프트 리셋(현재 위치를 목표로)
+- Z     : 하드 리셋(초기 상태)
+- B     : 난류 토글
+"""
+
+import argparse, math, time
+import numpy as np
+import pybullet as p
+import pybullet_data
+
+def clamp(x, lo, hi): return lo if x < lo else hi if x > hi else x
+def euler_from_quat(q): return p.getEulerFromQuaternion(q)
+def rot_body_to_world(q): return np.array(p.getMatrixFromQuaternion(q), dtype=float).reshape(3,3)
+
+class PID:
+    def __init__(self, kp, ki, kd, i_max=np.inf, out_min=-np.inf, out_max=np.inf, anti_windup=False):
+        self.kp, self.ki, self.kd = kp, ki, kd
+        self.i_max, self.out_min, self.out_max = i_max, out_min, out_max
+        self.anti_windup = anti_windup
+        self.i = 0.0; self.prev_e = 0.0; self.has_prev=False
+        self._last_u = 0.0
+    def reset(self): self.i=0.0; self.prev_e=0.0; self.has_prev=False; self._last_u=0.0
+    def __call__(self, e, dt):
+        d = 0.0 if (not self.has_prev or dt<=0) else (e - self.prev_e)/dt
+        if not self.anti_windup or (self.out_min < self._last_u < self.out_max):
+            self.i += e*dt; self.i = clamp(self.i, -self.i_max, self.i_max)
+        u = self.kp*e + self.ki*self.i + self.kd*d
+        u = clamp(u, self.out_min, self.out_max)
+        self.prev_e = e; self.has_prev=True; self._last_u = u
+        return u
+
+class QuadX:
+    def __init__(self, client, mass=1.0, arm_len=0.20, k_yaw=0.02,
+                 max_f_per_rotor=12.0, cd_lin=0.06, cd_ang=0.02, motor_tau=0.06):
+        self.cid=client; self.m=mass; self.L=arm_len; self.k_yaw=k_yaw
+        self.max_f=max_f_per_rotor; self.cd_lin=cd_lin; self.cd_ang=cd_ang
+        self.motor_tau = motor_tau
+
+        half=[0.15,0.15,0.05]
+        col=p.createCollisionShape(p.GEOM_BOX, halfExtents=half, physicsClientId=self.cid)
+        vis=p.createVisualShape(p.GEOM_BOX, halfExtents=half, rgbaColor=[0.2,0.3,0.9,1.0], physicsClientId=self.cid)
+        self.uid=p.createMultiBody(baseMass=self.m, baseCollisionShapeIndex=col,
+                                   baseVisualShapeIndex=vis, basePosition=[0,0,0.12],
+                                   physicsClientId=self.cid)
+
+        L=self.L
+        self.r_body=np.array([[+L,+L,0.0],[+L,-L,0.0],[-L,-L,0.0],[-L,+L,0.0]],dtype=float)
+        self.spin=np.array([+1.0,-1.0,+1.0,-1.0],dtype=float)
+
+        x=self.r_body[:,0]; y=self.r_body[:,1]
+        A=np.vstack([np.ones(4), y, -x, self.spin])
+        self.A=A; self.A_inv=np.linalg.inv(A)
+
+        g = 9.81
+        # Altitude controller: PD(vz damping) + tiny conditional I (anti-windup)
+        self.kp_z = 12.0
+        self.kd_z = 8.0
+        self.alt_i = PID(kp=0.0, ki=1.2, kd=0.0, i_max=2.0, out_min=-3.0, out_max=3.0, anti_windup=True)
+
+        # Attitude PID (torques)
+        self.roll_pid = PID(kp=0.95, ki=0.0, kd=0.24, out_min=-1.8, out_max=1.8)
+        self.pitch_pid= PID(kp=0.95, ki=0.0, kd=0.24, out_min=-1.8, out_max=1.8)
+        self.yaw_pid  = PID(kp=0.65, ki=0.0, kd=0.12, out_min=-1.2, out_max=1.2)
+
+        # Horizontal velocity PID -> accel
+        self.vx_pid   = PID(kp=1.8,  ki=0.2,  kd=0.0,  i_max=1.0, out_min=-6.0, out_max=6.0)
+        self.vy_pid   = PID(kp=1.8,  ki=0.2,  kd=0.0,  i_max=1.0, out_min=-6.0, out_max=6.0)
+
+        self.g = g
+        self.init_pose = ([0,0,0.12], [0,0,0,1])
+        self.reset_targets()
+        self.f = np.zeros(4, dtype=float)
+
+    def reset_targets(self):
+        pos,orn=p.getBasePositionAndOrientation(self.uid, physicsClientId=self.cid)
+        roll,pitch,yaw=euler_from_quat(orn)
+        self.sp_pos=np.array(pos,dtype=float)     # hover 기준 고도
+        self.sp_yaw=float(yaw)
+        self.sp_vel_xy=np.array([0.0, 0.0], dtype=float)
+        self.sp_vz=0.0
+        # reset controllers
+        self.alt_i.reset(); self.roll_pid.reset(); self.pitch_pid.reset()
+        self.yaw_pid.reset(); self.vx_pid.reset(); self.vy_pid.reset()
+
+    def hard_reset(self):
+        p.resetBasePositionAndOrientation(self.uid, self.init_pose[0], self.init_pose[1], physicsClientId=self.cid)
+        p.resetBaseVelocity(self.uid, [0,0,0], [0,0,0], physicsClientId=self.cid)
+        self.f[:] = 0.0
+        self.reset_targets()
+
+    def step(self, dt, wind_world=(0,0,0), noisy=False):
+        # Integrate W/S vertical velocity command into z setpoint
+        self.sp_pos[2] = clamp(self.sp_pos[2] + self.sp_vz*dt, 0.05, 8.0)
+
+        pos,orn=p.getBasePositionAndOrientation(self.uid, physicsClientId=self.cid)
+        lin_vel,ang_vel=p.getBaseVelocity(self.uid, physicsClientId=self.cid)
+        roll,pitch,yaw=euler_from_quat(orn)
+        R=rot_body_to_world(orn)
+        pos=np.array(pos); lin_vel=np.array(lin_vel); ang_vel=np.array(ang_vel)
+
+        # ---------- 1) Altitude control ----------
+        z = pos[2]; vz = lin_vel[2]
+        e_z = self.sp_pos[2] - z
+
+        # PD with velocity damping + conditional I
+        u_p = self.kp_z * e_z
+        u_d = self.kd_z * (-vz)
+        u_i = self.alt_i(e_z, dt)   # anti-windup + clamped
+
+        T = self.m*self.g + (u_p + u_d + u_i)
+        T = clamp(T, 0.0, 2.5*self.m*self.g)
+
+        # ---------- 2) XY velocity -> desired accel -> desired roll/pitch ----------
+        vx, vy = lin_vel[0], lin_vel[1]
+        ex = self.sp_vel_xy[0] - vx
+        ey = self.sp_vel_xy[1] - vy
+        ax_des = self.vx_pid(ex, dt)
+        ay_des = self.vy_pid(ey, dt)
+
+        cy, sy = math.cos(yaw), math.sin(yaw)
+        ax_body =  cy*ax_des + sy*ay_des
+        ay_body = -sy*ax_des + cy*ay_des
+
+        theta_des = clamp(ax_body/self.g, -0.35, 0.35)   # pitch
+        phi_des   = clamp(-ay_body/self.g, -0.35, 0.35)  # roll
+
+        # ---------- 3) Attitude PID ----------
+        e_roll  = phi_des   - roll
+        e_pitch = theta_des - pitch
+        e_yaw   = (self.sp_yaw - yaw + math.pi)%(2*math.pi) - math.pi
+        tau_x=self.roll_pid(e_roll, dt)
+        tau_y=self.pitch_pid(e_pitch, dt)
+        tau_z=self.yaw_pid(e_yaw, dt)
+
+        # ---------- 4) Allocation ----------
+        b=np.array([T, tau_x, tau_y, tau_z/max(self.k_yaw,1e-6)],dtype=float)
+        f_cmd=self.A_inv@b
+        f_cmd=np.clip(f_cmd, 0.0, self.max_f)
+
+        # motor lag
+        alpha = clamp(dt/max(self.motor_tau,1e-4), 0.0, 1.0)
+        self.f += alpha*(f_cmd - self.f)
+        f = self.f.copy()
+
+        # drags
+        F_drag = - self.cd_lin*lin_vel
+        Tau_drag = - self.cd_ang*ang_vel
+
+        # rotor forces
+        for i in range(4):
+            z_world = R @ np.array([0,0,1.0])
+            F_world = z_world * float(f[i])
+            r_w = pos + (R @ self.r_body[i])
+            p.applyExternalForce(self.uid, -1, F_world.tolist(), r_w.tolist(),
+                                 flags=p.WORLD_FRAME, physicsClientId=self.cid)
+
+        # yaw torque + angular drag
+        tau_world = (R @ np.array([0,0,tau_z])) + Tau_drag
+        p.applyExternalTorque(self.uid, -1, tau_world.tolist(), flags=p.WORLD_FRAME, physicsClientId=self.cid)
+
+        # linear drag + wind
+        wind = np.array(wind_world, dtype=float)
+        p.applyExternalForce(self.uid, -1, (F_drag + wind).tolist(),
+                             pos.tolist(), flags=p.WORLD_FRAME, physicsClientId=self.cid)
+
+        return dict(pos=pos, roll=roll, pitch=pitch, yaw=yaw, f=f, T=T, tau=[tau_x,tau_y,tau_z],
+                    vxy=(vx,vy), vz=vz, sp_vz=self.sp_vz,
+                    phi_des=phi_des, theta_des=theta_des)
+
+# --- Keyboard helpers ---
+EDGE = p.KEY_WAS_TRIGGERED
+ISDN = p.KEY_IS_DOWN
+def key_edge(keys, *codes): return any((c in keys) and (keys[c] & EDGE) for c in codes)
+def key_down(keys, *codes): return any((c in keys) and (keys[c] & ISDN) for c in codes)
+
+def handle_keys(keys, quad: QuadX, dt, state):
+    if key_edge(keys, p.B3G_SPACE): state["hover_hold"] = not state["hover_hold"]
+    if key_edge(keys, ord('P'), ord('p')): state["paused"] = not state["paused"]
+    if key_edge(keys, ord('C'), ord('c')): quad.reset_targets()
+    if key_edge(keys, ord('Z'), ord('z')): quad.hard_reset()
+    if key_edge(keys, ord('T'), ord('t')): quad.sp_pos[2] = max(quad.sp_pos[2], 1.5); state["hover_hold"] = True
+    if key_edge(keys, ord('L'), ord('l')): quad.sp_pos[2] = 0.12; state["hover_hold"] = True
+    if key_edge(keys, ord('B'), ord('b')): state["gust_on"] = not state["gust_on"]
+
+    v_cmd = 3.0      # m/s (XY)
+    vz_cmd = 1.0     # m/s (Z)
+    yaw_rate = math.radians(45)
+
+    # XY velocity (press to move, release to stop)
+    vx_sp, vy_sp = 0.0, 0.0
+    if key_down(keys, p.B3G_UP_ARROW):
+        vx_sp += v_cmd*math.cos(quad.sp_yaw);  vy_sp += v_cmd*math.sin(quad.sp_yaw)
+    if key_down(keys, p.B3G_DOWN_ARROW):
+        vx_sp -= v_cmd*math.cos(quad.sp_yaw);  vy_sp -= v_cmd*math.sin(quad.sp_yaw)
+    if key_down(keys, p.B3G_LEFT_ARROW):
+        vx_sp += v_cmd*math.cos(quad.sp_yaw + math.pi/2); vy_sp += v_cmd*math.sin(quad.sp_yaw + math.pi/2)
+    if key_down(keys, p.B3G_RIGHT_ARROW):
+        vx_sp -= v_cmd*math.cos(quad.sp_yaw + math.pi/2); vy_sp -= v_cmd*math.sin(quad.sp_yaw + math.pi/2)
+    quad.sp_vel_xy[:] = [vx_sp, vy_sp]
+
+    # Vertical velocity via W/S (+ PageUp/PageDown)
+    vz = 0.0
+    if key_down(keys, ord('W'), ord('w'), p.B3G_PAGE_UP):   vz += vz_cmd
+    if key_down(keys, ord('S'), ord('s'), p.B3G_PAGE_DOWN): vz -= vz_cmd
+    quad.sp_vz = vz  # release -> 0 -> 바로 hover
+
+    # Yaw
+    if key_down(keys, ord('Q'), ord('q')): quad.sp_yaw += yaw_rate * dt
+    if key_down(keys, ord('E'), ord('e')): quad.sp_yaw -= yaw_rate * dt
+
+    return state
+
+def main():
+    ap=argparse.ArgumentParser()
+    ap.add_argument("--gui", action="store_true")
+    ap.add_argument("--simrate", type=float, default=1.0)
+    ap.add_argument("--wind", type=float, nargs=3, default=[0.0,0.0,0.0])
+    ap.add_argument("--noisy", action="store_true")
+    args=ap.parse_args()
+
+    cid=p.connect(p.GUI if args.gui else p.DIRECT)
+    p.setAdditionalSearchPath(pybullet_data.getDataPath())
+    p.resetSimulation(); p.setGravity(0,0,-9.81); p.loadURDF("plane.urdf")
+    p.configureDebugVisualizer(p.COV_ENABLE_KEYBOARD_SHORTCUTS, 0)
+
+    dt=1.0/240.0
+    p.setTimeStep(dt); p.setRealTimeSimulation(0)
+
+    quad=QuadX(cid, mass=1.0, arm_len=0.20, k_yaw=0.02,
+               max_f_per_rotor=12.0, cd_lin=0.08, cd_ang=0.03, motor_tau=0.06)
+
+    state=dict(hover_hold=True, paused=False, gust_on=False)
+    sim_clock=0.0; wall_prev=time.time()
+
+    print("[UAV] ↑↓←→: XY | W/S(or PgUp/PgDn): 상하(누른 만큼) | Q/E: 요 | SPACE: hold | T/L: 이륙/착륙 | P: 일시정지 | C/Z: 소프트/하드 리셋 | B: 난류")
+
+    try:
+        while True:
+            wall_now=time.time(); wall_dt=wall_now-wall_prev; wall_prev=wall_now
+            steps=max(1, int((args.simrate*wall_dt)/dt)) if args.gui else 1
+            for _ in range(steps):
+                keys=p.getKeyboardEvents() if args.gui else {}
+                state=handle_keys(keys, quad, dt, state)
+
+                if not state["paused"]:
+                    gust = 0.8*np.random.randn(3) if state["gust_on"] else np.zeros(3)
+                    wind_world = (args.wind[0]+gust[0], args.wind[1]+gust[1], args.wind[2]+gust[2])
+                    _ = quad.step(dt, wind_world=wind_world, noisy=bool(args.noisy or state["gust_on"]))
+                    sim_clock+=dt
+
+                # safety fence
+                pos=np.array(p.getBasePositionAndOrientation(quad.uid)[0])
+                if np.linalg.norm(pos[:2])>20 or pos[2]>12:
+                    p.resetBaseVelocity(quad.uid, linearVelocity=[0,0,-0.3], angularVelocity=[0,0,0])
+                    quad.sp_pos = pos * np.array([0.5,0.5,1.0]); quad.sp_pos[2]=min(quad.sp_pos[2], 1.5)
+
+                p.stepSimulation()
+
+            # camera follow
+            if args.gui:
+                pos,orn=p.getBasePositionAndOrientation(quad.uid)
+                yaw_deg = math.degrees(euler_from_quat(orn)[2])
+                p.resetDebugVisualizerCamera(cameraDistance=3.0, cameraYaw=yaw_deg+45,
+                                             cameraPitch=-30, cameraTargetPosition=list(pos))
+                time.sleep(max(0.0, dt/args.simrate - (time.time()-wall_now)))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        p.disconnect()
+
+if __name__=="__main__":
+    main()
